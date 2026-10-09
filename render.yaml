@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: flow-ai-kpc
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: AI_MODEL
+        value: gemini-3.5-flash
+      - key: AI_FAST_MODEL
+        value: gemini-3.5-flash
+      - key: BOT_NAME
+        value: КПК
+      - key: AUTONOMOUS_MINUTES
+        value: "12"
+      - key: SILENCE_SECONDS
+        value: "10"
