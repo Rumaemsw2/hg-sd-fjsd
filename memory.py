@@ -1,0 +1,371 @@
+import sqlite3
+import threading
+from pathlib import Path
+
+DB_PATH = Path(__file__).with_name("memory.db")
+
+
+class Memory:
+    def __init__(self, limit=120):
+        self.limit = limit
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                fact TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, username, fact)
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                type TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS stickers (
+                file_id TEXT PRIMARY KEY,
+                emoji TEXT NOT NULL DEFAULT '',
+                set_name TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS business_modes (
+                connection_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (connection_id, chat_id)
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS business_message_cache (
+                connection_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sender TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL DEFAULT '',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (connection_id, chat_id, message_id)
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS business_owners (
+                connection_id TEXT PRIMARY KEY,
+                owner_id INTEGER NOT NULL,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.db.commit()
+
+    # ---------- Telegram Business AI switches ----------
+    def set_business_mode(self, connection_id, chat_id, enabled):
+        with self.lock:
+            self.db.execute(
+                """INSERT INTO business_modes(connection_id, chat_id, enabled)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(connection_id, chat_id) DO UPDATE SET
+                     enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP""",
+                (str(connection_id), int(chat_id), 1 if enabled else 0),
+            )
+            self.db.commit()
+
+    def business_mode_enabled(self, connection_id, chat_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT enabled FROM business_modes WHERE connection_id = ? AND chat_id = ?",
+                (str(connection_id), int(chat_id)),
+            ).fetchone()
+        return bool(row and row[0])
+
+    def cache_business_message(self, connection_id, chat_id, message_id, sender, text):
+        with self.lock:
+            self.db.execute(
+                """INSERT INTO business_message_cache(connection_id, chat_id, message_id, sender, text)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(connection_id, chat_id, message_id) DO UPDATE SET
+                     sender=excluded.sender, text=excluded.text, updated_at=CURRENT_TIMESTAMP""",
+                (str(connection_id), int(chat_id), int(message_id), (sender or "")[:100], (text or "")[:4000]),
+            )
+            # Коммитим сразу — чтобы при быстром удалении текст уже был в БД.
+            self.db.commit()
+            # Чистку делаем реже (каждые ~50 вставок по message_id), кеш до 3000 на чат.
+            if int(message_id) % 50 == 0:
+                self.db.execute(
+                    """DELETE FROM business_message_cache WHERE rowid IN (
+                         SELECT rowid FROM business_message_cache WHERE connection_id=? AND chat_id=?
+                         ORDER BY updated_at DESC, message_id DESC LIMIT -1 OFFSET 3000)""",
+                    (str(connection_id), int(chat_id)),
+                )
+                self.db.commit()
+
+    def get_business_message(self, connection_id, chat_id, message_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT sender, text FROM business_message_cache WHERE connection_id=? AND chat_id=? AND message_id=?",
+                (str(connection_id), int(chat_id), int(message_id)),
+            ).fetchone()
+        return row
+
+    def delete_business_message(self, connection_id, chat_id, message_id):
+        with self.lock:
+            self.db.execute(
+                "DELETE FROM business_message_cache WHERE connection_id=? AND chat_id=? AND message_id=?",
+                (str(connection_id), int(chat_id), int(message_id)),
+            )
+            self.db.commit()
+
+    def get_recent_business_messages(self, connection_id, chat_id, limit=20):
+        """Return list of (message_id, sender, text) newest first."""
+        with self.lock:
+            rows = self.db.execute(
+                """SELECT message_id, sender, text FROM business_message_cache
+                   WHERE connection_id=? AND chat_id=?
+                   ORDER BY message_id DESC LIMIT ?""",
+                (str(connection_id), int(chat_id), int(limit)),
+            ).fetchall()
+        return rows
+
+    def list_business_chats(self, connection_id=None, limit=30):
+        """Return list of (connection_id, chat_id, title_or_id) for known business chats."""
+        with self.lock:
+            if connection_id:
+                rows = self.db.execute(
+                    """SELECT DISTINCT connection_id, chat_id FROM business_message_cache
+                       WHERE connection_id=? ORDER BY updated_at DESC LIMIT ?""",
+                    (str(connection_id), int(limit)),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    """SELECT DISTINCT connection_id, chat_id FROM business_message_cache
+                       ORDER BY updated_at DESC LIMIT ?""",
+                    (int(limit),),
+                ).fetchall()
+        result = []
+        for conn, cid in rows:
+            title = self.chat_title(cid)
+            result.append((conn, cid, title))
+        return result
+
+    def get_connection_for_chat(self, chat_id):
+        """Return most recent connection_id that has cache for this chat_id, or None."""
+        with self.lock:
+            row = self.db.execute(
+                """SELECT connection_id FROM business_message_cache
+                   WHERE chat_id=? ORDER BY updated_at DESC LIMIT 1""",
+                (int(chat_id),),
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_business_owner(self, connection_id, owner_id, is_enabled=True):
+        with self.lock:
+            self.db.execute(
+                """INSERT INTO business_owners(connection_id, owner_id, is_enabled)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(connection_id) DO UPDATE SET
+                     owner_id=excluded.owner_id,
+                     is_enabled=excluded.is_enabled,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (str(connection_id), int(owner_id), 1 if is_enabled else 0),
+            )
+            self.db.commit()
+
+    def is_business_owner(self, user_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT 1 FROM business_owners WHERE owner_id=? AND is_enabled=1 LIMIT 1",
+                (int(user_id),),
+            ).fetchone()
+        return row is not None
+
+    def get_owner_connections(self, owner_id):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT connection_id FROM business_owners WHERE owner_id=? AND is_enabled=1",
+                (int(owner_id),),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    # ---------- чаты / админы / стикеры ----------
+    def touch_chat(self, chat_id, title, chat_type):
+        with self.lock:
+            self.db.execute(
+                """INSERT INTO chats(chat_id, title, type) VALUES (?, ?, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                     title = excluded.title, type = excluded.type,
+                     updated_at = CURRENT_TIMESTAMP""",
+                (chat_id, (title or str(chat_id))[:100], chat_type),
+            )
+            self.db.commit()
+
+    def list_chats(self, limit=20):
+        with self.lock:
+            return self.db.execute(
+                """SELECT chat_id, title FROM chats
+                   WHERE type IN ('group', 'supergroup')
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+    def chat_title(self, chat_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT title FROM chats WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+        return row[0] if row else str(chat_id)
+
+    def add_admin(self, user_id):
+        with self.lock:
+            self.db.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (user_id,))
+            self.db.commit()
+
+    def remove_admin(self, user_id):
+        with self.lock:
+            self.db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+            self.db.commit()
+
+    def is_admin(self, user_id):
+        with self.lock:
+            return self.db.execute(
+                "SELECT 1 FROM admins WHERE user_id = ?", (user_id,)
+            ).fetchone() is not None
+
+    @staticmethod
+    def _emoji(e):
+        return (e or "").replace("\ufe0f", "").strip()
+
+    def add_sticker(self, file_id, emoji, set_name=""):
+        with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO stickers(file_id, emoji, set_name) VALUES (?, ?, ?)",
+                (file_id, self._emoji(emoji), set_name or ""),
+            )
+            self.db.commit()
+
+    def pick_sticker(self, emoji):
+        e = self._emoji(emoji)
+        with self.lock:
+            row = self.db.execute(
+                "SELECT file_id FROM stickers WHERE emoji = ? ORDER BY RANDOM() LIMIT 1",
+                (e,),
+            ).fetchone()
+            if not row:
+                row = self.db.execute(
+                    "SELECT file_id FROM stickers ORDER BY RANDOM() LIMIT 1"
+                ).fetchone()
+        return row[0] if row else None
+
+    def get_last_messages(self, chat_id, limit=20):
+        """Последние сообщения обычной истории (не business-cache). Newest first."""
+        with self.lock:
+            rows = self.db.execute(
+                """SELECT username, text FROM messages
+                   WHERE chat_id=? ORDER BY id DESC LIMIT ?""",
+                (int(chat_id), int(limit)),
+            ).fetchall()
+        return rows
+
+    def add(self, chat_id, username, text):
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO messages(chat_id, username, text) VALUES (?, ?, ?)",
+                (chat_id, username[:100], text[:4000]),
+            )
+            self.db.execute(
+                """DELETE FROM messages
+                   WHERE chat_id = ? AND id NOT IN (
+                       SELECT id FROM messages
+                       WHERE chat_id = ?
+                       ORDER BY id DESC LIMIT ?
+                   )""",
+                (chat_id, chat_id, self.limit),
+            )
+            self.db.commit()
+            return self.db.execute(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()[0]
+
+    def context(self, chat_id):
+        with self.lock:
+            facts = self.db.execute(
+                """SELECT username, fact FROM facts
+                   WHERE chat_id = ?
+                   ORDER BY id DESC LIMIT 80""",
+                (chat_id,),
+            ).fetchall()
+            rows = self.db.execute(
+                """SELECT username, text FROM messages
+                   WHERE chat_id = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (chat_id, self.limit),
+            ).fetchall()
+
+        rows.reverse()
+        parts = []
+
+        if facts:
+            parts.append(
+                "ДОЛГОСРОЧНАЯ ПАМЯТЬ "
+                "(только ранее явно сказанные факты):"
+            )
+            parts.extend(f"{u}: {f}" for u, f in reversed(facts))
+
+        parts.append("ПОСЛЕДНИЕ СООБЩЕНИЯ:")
+        parts.extend(f"{u}: {t}" for u, t in rows)
+        return "\n".join(parts)
+
+    def add_fact(self, chat_id, username, fact):
+        fact = (fact or "").strip()[:500]
+        if not fact:
+            return
+
+        with self.lock:
+            self.db.execute(
+                """INSERT OR IGNORE INTO facts(chat_id, username, fact)
+                   VALUES (?, ?, ?)""",
+                (chat_id, username[:100], fact),
+            )
+            self.db.execute(
+                """DELETE FROM facts
+                   WHERE chat_id = ? AND id NOT IN (
+                       SELECT id FROM facts
+                       WHERE chat_id = ?
+                       ORDER BY id DESC LIMIT 200
+                   )""",
+                (chat_id, chat_id),
+            )
+            self.db.commit()
+
+    def clear_chat(self, chat_id):
+        """Удаляет всю историю сообщений и факты только для этого чата."""
+        with self.lock:
+            self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+            self.db.execute("DELETE FROM facts WHERE chat_id = ?", (chat_id,))
+            self.db.commit()
